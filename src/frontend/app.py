@@ -29,7 +29,7 @@ def get_secret(key: str) -> str | None:
 MODELS = [
     ModelOption(label="GPT-5.2", model_id="gpt-5.2-2025-12-11", provider="openai"),
     ModelOption(label="Claude 4.5 Sonnet", model_id="claude-sonnet-4-5-20250929", provider="anthropic"),
-    ModelOption(label="Gemini 3 Flash", model_id="gemini-2.0-flash", provider="gemini"),
+    ModelOption(label="Gemini 3 Pro", model_id="gemini-3-pro-preview", provider="gemini"),
 ]
 
 
