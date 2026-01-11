@@ -55,6 +55,8 @@ if "hot_seat_round" not in st.session_state:
     st.session_state.hot_seat_round = 0
 if "report" not in st.session_state:
     st.session_state.report = None
+if "identities_revealed" not in st.session_state:
+    st.session_state.identities_revealed = False
 
 # Sidebar
 with st.sidebar:
@@ -95,6 +97,7 @@ with st.sidebar:
             st.session_state.orch = None
             st.session_state.hot_seat_round = 0
             st.session_state.report = None
+            st.session_state.identities_revealed = False
             st.rerun()
 
 # Main content area
@@ -221,14 +224,20 @@ elif st.session_state.stage == "complete":
     st.divider()
 
     # Display final report
-    st.subheader("📊 Final Report & Reveal")
+    st.subheader("📊 Final Report")
     st.write(st.session_state.report)
 
-    # Reveal participant identities
+    # Reveal participant identities with button
     st.divider()
     st.subheader("🎭 The Reveal")
-    for pid, model_opt in orch.assignments.items():
-        st.success(f"**{pid.value}** was **{model_opt.label}** ({model_opt.model_id})")
+
+    if not st.session_state.identities_revealed:
+        if st.button("Reveal Participant Identities", type="primary"):
+            st.session_state.identities_revealed = True
+            st.rerun()
+    else:
+        for pid, model_opt in orch.assignments.items():
+            st.success(f"**{pid.value}** was **{model_opt.label}** ({model_opt.model_id})")
 
 
 def main():

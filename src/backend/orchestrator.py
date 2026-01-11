@@ -99,11 +99,12 @@ class DebateOrchestrator:
 
         prompt = (
             f"Analyze this debate on '{self.topic}':\n\n{full_text}\n\n"
-            "Create a report: Executive Summary, Consensus/Divergence, Perspective Shifts. "
-            "Finally, reveal the models used:\n"
+            "Create a report with these sections:\n"
+            "1. Executive Summary\n"
+            "2. Key Areas of Consensus and Divergence\n"
+            "3. Notable Perspective Shifts\n\n"
+            "Do NOT reveal which models were used - that will be shown separately."
         )
-        for pid, opt in self.assignments.items():
-            prompt += f"- {pid.value}: {opt.label} ({opt.model_id})\n"
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, synth_agent.generate, prompt)
