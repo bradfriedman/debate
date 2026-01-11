@@ -347,9 +347,17 @@ class GeminiAgent(BaseAgent):
                                     tools=[self.tools]
                                 )
                             )
-                            return final_response.text or ""
+                            # Extract text parts from final response
+                            if final_response.candidates and final_response.candidates[0].content:
+                                text_parts = [p.text for p in final_response.candidates[0].content.parts if hasattr(p, 'text') and p.text]
+                                return " ".join(text_parts) if text_parts else ""
+                            return ""
 
-            return response.text or ""
+            # Extract text parts from response (avoid using .text property which triggers warning)
+            if response.candidates and response.candidates[0].content:
+                text_parts = [p.text for p in response.candidates[0].content.parts if hasattr(p, 'text') and p.text]
+                return " ".join(text_parts) if text_parts else ""
+            return ""
         except AgentAPIError:
             raise
         except Exception as e:
