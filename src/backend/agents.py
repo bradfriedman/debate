@@ -84,8 +84,11 @@ class BaseAgent(abc.ABC):
     def _format_history(self, transcript: list[DialogueItem]) -> str:
         text = "--- TRANSCRIPT START ---\n"
         for item in transcript:
-            target = f"(to {item.target.value})" if item.target else ""
-            text += f"[{item.speaker.value} - {item.turn_type.value}{target}]: {item.content}\n"
+            if item.turn_type == TurnType.FOLLOWUP_PROMPT:
+                text += f"\n[AUDIENCE FOLLOW-UP MESSAGE]: {item.content}\n\n"
+            else:
+                target = f"(to {item.target.value})" if item.target else ""
+                text += f"[{item.speaker.value} - {item.turn_type.value}{target}]: {item.content}\n"
         text += "--- TRANSCRIPT END ---\n"
         return text
 
@@ -101,10 +104,10 @@ class BaseAgent(abc.ABC):
     def generate_question(self, transcript: list[DialogueItem], target: ParticipantID) -> str:
         hist = self._format_history(transcript)
 
-        # Extract target's opening statement to make their position explicit
+        # Extract target's most recent opening-type statement to make their position explicit
         target_opening = next(
-            (item.content for item in transcript
-             if item.speaker == target and item.turn_type == TurnType.OPENING),
+            (item.content for item in reversed(transcript)
+             if item.speaker == target and item.turn_type in (TurnType.OPENING, TurnType.FOLLOWUP_OPENING)),
             None
         )
 
@@ -129,6 +132,16 @@ class BaseAgent(abc.ABC):
     def generate_closing(self, transcript: list[DialogueItem]) -> str:
         hist = self._format_history(transcript)
         return self.generate(f"{hist}\nINSTRUCTION: Provide Closing Statement. Summarize your view and any changes of opinion. Limit 200 words.")
+
+    def generate_followup_opening(self, transcript: list[DialogueItem]) -> str:
+        hist = self._format_history(transcript)
+        return self.generate(
+            f"{hist}\n"
+            f"INSTRUCTION: The audience has submitted a follow-up message (shown above as "
+            f"[AUDIENCE FOLLOW-UP MESSAGE]). Address the new information or questions raised, "
+            f"and provide an updated position statement. Update or reaffirm your stance in light "
+            f"of this follow-up. Limit 200 words."
+        )
 
 
 # --- OpenAI Agent ---

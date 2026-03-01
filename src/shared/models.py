@@ -8,6 +8,7 @@ class ParticipantID(str, Enum):
     P1 = "Participant 1"
     P2 = "Participant 2"
     P3 = "Participant 3"
+    MODERATOR = "Moderator"
 
 
 class TurnType(str, Enum):
@@ -15,6 +16,8 @@ class TurnType(str, Enum):
     QUESTION = "Question"
     ANSWER = "Answer"
     CLOSING = "Closing Statement"
+    FOLLOWUP_PROMPT = "Follow-up"
+    FOLLOWUP_OPENING = "Updated Opening"
 
 
 class DialogueItem(BaseModel):

@@ -1,10 +1,13 @@
 import asyncio
 import random
+from collections.abc import Callable
 from typing import List
 from src.shared.models import ParticipantID, DialogueItem, TurnType, ModelOption
 from src.backend.agents import create_agent, AgentAPIError
 
 MINIMUM_RESPONSE_CHARS = 15
+MAX_RETRIES = 3          # Total attempts per call (initial + 2 retries)
+RETRY_DELAY_SECONDS = 2  # Fixed delay between attempts
 
 
 class DebateOrchestrator:
@@ -55,6 +58,28 @@ class DebateOrchestrator:
                 f"during {context}. This may indicate an API issue or content filtering."
             )
 
+    async def _call_with_retry(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        fn: Callable[[], str],
+        speaker: ParticipantID,
+        context: str,
+    ) -> str:
+        """Run fn() in a thread executor, retrying on blank responses before failing."""
+        last_text = ""
+        for attempt in range(MAX_RETRIES):
+            last_text = await loop.run_in_executor(None, fn)
+            if len(last_text.strip()) >= MINIMUM_RESPONSE_CHARS:
+                return last_text
+            if attempt < MAX_RETRIES - 1:
+                print(
+                    f"[Retry {attempt + 1}/{MAX_RETRIES - 1}] Blank response from "
+                    f"{speaker.value} during {context}. Retrying in {RETRY_DELAY_SECONDS}s..."
+                )
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+        self._validate_response(last_text, speaker, context)
+        return last_text  # unreachable; satisfies type checker
+
     # ... (Run Opening/HotSeat/Closing methods remain identical to previous design) ...
     # They call agent.generate_opening() etc., which are defined in BaseAgent
 
@@ -64,14 +89,12 @@ class DebateOrchestrator:
         # this is important for the UI to remain responsive.
 
         loop = asyncio.get_running_loop()
-        tasks = []
-        for pid, agent in self.agents.items():
-            tasks.append(loop.run_in_executor(None, agent.generate_opening))
-
+        tasks = [
+            self._call_with_retry(loop, agent.generate_opening, pid, "opening statement")
+            for pid, agent in self.agents.items()
+        ]
         results = await asyncio.gather(*tasks)
 
-        for pid, text in zip(self.agents.keys(), results):
-            self._validate_response(text, pid, "opening statement")
         for pid, text in zip(self.agents.keys(), results):
             self.transcript.append(DialogueItem(
                 speaker=pid, turn_type=TurnType.OPENING, content=text))
@@ -79,43 +102,85 @@ class DebateOrchestrator:
     async def run_hot_seat(self, hot_seat_pid: ParticipantID):
         loop = asyncio.get_running_loop()
         hot_seat_agent = self.agents[hot_seat_pid]
-        others = [p for p in ParticipantID if p != hot_seat_pid]
+        others = [p for p in self.agents if p != hot_seat_pid]
         random.shuffle(others)
 
         for asker_pid in others:
             asker_agent = self.agents[asker_pid]
 
             # Asker
-            q_text = await loop.run_in_executor(None, asker_agent.generate_question, self.transcript, hot_seat_pid)
-            self._validate_response(q_text, asker_pid, f"question to {hot_seat_pid.value}")
+            q_text = await self._call_with_retry(
+                loop,
+                lambda a=asker_agent: a.generate_question(self.transcript, hot_seat_pid),
+                asker_pid,
+                f"question to {hot_seat_pid.value}",
+            )
             self.transcript.append(DialogueItem(
                 speaker=asker_pid, turn_type=TurnType.QUESTION, target=hot_seat_pid, content=q_text))
 
             # Answerer
-            a_text = await loop.run_in_executor(None, hot_seat_agent.generate_answer, self.transcript, q_text, asker_pid)
-            self._validate_response(a_text, hot_seat_pid, f"answer to {asker_pid.value}")
+            a_text = await self._call_with_retry(
+                loop,
+                lambda: hot_seat_agent.generate_answer(self.transcript, q_text, asker_pid),
+                hot_seat_pid,
+                f"answer to {asker_pid.value}",
+            )
             self.transcript.append(DialogueItem(
                 speaker=hot_seat_pid, turn_type=TurnType.ANSWER, target=asker_pid, content=a_text))
 
     async def run_closing(self):
         loop = asyncio.get_running_loop()
-        tasks = [loop.run_in_executor(
-            None, agent.generate_closing, self.transcript) for agent in self.agents.values()]
+        tasks = [
+            self._call_with_retry(
+                loop,
+                lambda agent=agent: agent.generate_closing(self.transcript),
+                pid,
+                "closing statement",
+            )
+            for pid, agent in self.agents.items()
+        ]
         results = await asyncio.gather(*tasks)
 
         for pid, text in zip(self.agents.keys(), results):
-            self._validate_response(text, pid, "closing statement")
-        for pid, text in zip(self.agents.keys(), results):
             self.transcript.append(DialogueItem(
                 speaker=pid, turn_type=TurnType.CLOSING, content=text))
+
+    async def run_followup(self, user_message: str) -> None:
+        """Append user follow-up to transcript and generate updated opening statements."""
+        self.transcript.append(DialogueItem(
+            speaker=ParticipantID.MODERATOR,
+            turn_type=TurnType.FOLLOWUP_PROMPT,
+            content=user_message
+        ))
+
+        loop = asyncio.get_running_loop()
+        tasks = [
+            self._call_with_retry(
+                loop,
+                lambda agent=agent: agent.generate_followup_opening(self.transcript),
+                pid,
+                "updated opening statement",
+            )
+            for pid, agent in self.agents.items()
+        ]
+        results = await asyncio.gather(*tasks)
+
+        for pid, text in zip(self.agents.keys(), results):
+            self.transcript.append(DialogueItem(
+                speaker=pid, turn_type=TurnType.FOLLOWUP_OPENING, content=text))
 
     async def generate_report(self):
         # Use P1's agent for synthesis (reusing the instance)
         # Or instantiate a dedicated synthesis agent
         synth_agent = self.agents[ParticipantID.P1]
 
-        full_text = "\n".join(
-            [f"{i.speaker.value}: {i.content}" for i in self.transcript])
+        lines = []
+        for i in self.transcript:
+            if i.turn_type == TurnType.FOLLOWUP_PROMPT:
+                lines.append(f"\n[AUDIENCE FOLLOW-UP MESSAGE]: {i.content}\n")
+            else:
+                lines.append(f"{i.speaker.value}: {i.content}")
+        full_text = "\n".join(lines)
 
         prompt = (
             f"Analyze this debate on '{self.topic}':\n\n{full_text}\n\n"
@@ -127,6 +192,10 @@ class DebateOrchestrator:
         )
 
         loop = asyncio.get_running_loop()
-        report_text = await loop.run_in_executor(None, lambda: synth_agent.generate(prompt, max_tokens=4096))
-        self._validate_response(report_text, ParticipantID.P1, "synthesis report")
+        report_text = await self._call_with_retry(
+            loop,
+            lambda: synth_agent.generate(prompt, max_tokens=4096),
+            ParticipantID.P1,
+            "synthesis report",
+        )
         return report_text

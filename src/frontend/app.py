@@ -44,12 +44,22 @@ MODELS = [
 
 
 def render_transcript(items: list[DialogueItem], closings_expanded: bool = False) -> None:
-    """Render transcript with openings, grouped hot-seat rounds, and closing statements."""
+    """Render transcript with openings, grouped hot-seat rounds, closing statements, and follow-up rounds."""
     i = 0
+    followup_count = 0
     while i < len(items):
         item = items[i]
         if item.turn_type == TurnType.OPENING:
             with st.expander(f"**{item.speaker.value}** - Opening Statement", expanded=False):
+                st.write(escape_currency_dollars(item.content))
+            i += 1
+        elif item.turn_type == TurnType.FOLLOWUP_PROMPT:
+            followup_count += 1
+            st.markdown(f"---\n#### Follow-up Round {followup_count}")
+            st.info(f"**Audience Follow-up:** {escape_currency_dollars(item.content)}")
+            i += 1
+        elif item.turn_type == TurnType.FOLLOWUP_OPENING:
+            with st.expander(f"**{item.speaker.value}** - Updated Opening Statement", expanded=False):
                 st.write(escape_currency_dollars(item.content))
             i += 1
         elif item.turn_type == TurnType.QUESTION:
@@ -99,10 +109,14 @@ def run_async(coro):
 
 def abort_debate(error_msg: str) -> None:
     """Reset the debate back to setup, preserving topic and model selections, and record the error."""
+    if st.session_state.orch is not None:
+        st.session_state.topic = st.session_state.orch.topic
     st.session_state.stage = "setup"
     st.session_state.orch = None
     st.session_state.hot_seat_round = 0
-    st.session_state.report = None
+    st.session_state.reports = []
+    st.session_state.followup_round = 0
+    st.session_state.pending_followup = ""
     st.session_state.identities_revealed = False
     st.session_state.debate_error = error_msg
     st.rerun()
@@ -118,8 +132,12 @@ if "orch" not in st.session_state:
     st.session_state.orch = None
 if "hot_seat_round" not in st.session_state:
     st.session_state.hot_seat_round = 0
-if "report" not in st.session_state:
-    st.session_state.report = None
+if "reports" not in st.session_state:
+    st.session_state.reports = []
+if "followup_round" not in st.session_state:
+    st.session_state.followup_round = 0
+if "pending_followup" not in st.session_state:
+    st.session_state.pending_followup = ""
 if "identities_revealed" not in st.session_state:
     st.session_state.identities_revealed = False
 if "topic" not in st.session_state:
@@ -155,16 +173,22 @@ with st.sidebar:
         st.session_state.orch = DebateOrchestrator(st.session_state.topic, sel_models, api_keys)
         st.session_state.stage = "opening"
         st.session_state.hot_seat_round = 0
-        st.session_state.report = None
+        st.session_state.reports = []
+        st.session_state.followup_round = 0
+        st.session_state.pending_followup = ""
         st.rerun()
 
     # Reset button
     if st.session_state.stage != "setup":
         if st.button("Reset Debate"):
+            if st.session_state.orch is not None:
+                st.session_state.topic = st.session_state.orch.topic
             st.session_state.stage = "setup"
             st.session_state.orch = None
             st.session_state.hot_seat_round = 0
-            st.session_state.report = None
+            st.session_state.reports = []
+            st.session_state.followup_round = 0
+            st.session_state.pending_followup = ""
             st.session_state.identities_revealed = False
             st.rerun()
 
@@ -280,7 +304,7 @@ elif st.session_state.stage == "synthesis":
     try:
         with st.spinner("Generating final report..."):
             report = run_async(orch.generate_report())
-            st.session_state.report = report
+            st.session_state.reports.append(report)
 
         st.session_state.stage = "complete"
         st.rerun()
@@ -299,9 +323,14 @@ elif st.session_state.stage == "complete":
 
     st.divider()
 
-    # Display final report
-    st.subheader("📊 Final Report")
-    st.write(escape_currency_dollars(st.session_state.report or ""))
+    # Display all reports in sequence
+    reports: list[str] = st.session_state.reports or []
+    for idx, report_text in enumerate(reports):
+        label = "📊 Final Report" if idx == 0 else f"📊 Follow-up Round {idx} Report"
+        st.subheader(label)
+        st.write(escape_currency_dollars(report_text))
+        if idx < len(reports) - 1:
+            st.divider()
 
     # Reveal participant identities with button
     st.divider()
@@ -314,6 +343,50 @@ elif st.session_state.stage == "complete":
     else:
         for pid, model_opt in orch.assignments.items():
             st.success(f"**{pid.value}** was **{model_opt.label}** ({model_opt.model_id})")
+
+    # Follow-up input
+    st.divider()
+    st.subheader("Continue the Debate")
+    if st.session_state.debate_error:
+        st.error(st.session_state.debate_error)
+        st.info("Your follow-up text has been preserved below. Edit it if needed and resubmit.")
+    # Read session state before rendering the widget — it's already committed for this run,
+    # so this is lag-free (unlike using the widget's own return value for disabled=).
+    has_followup_text = bool(st.session_state.get("followup_input_text", "").strip())
+    followup_text: str = st.text_area(
+        "Submit a follow-up question or new information for all participants:",
+        key="followup_input_text",
+        height=120,
+    )
+    if st.button("Submit Follow-up", type="primary", disabled=not has_followup_text):
+        st.session_state.debate_error = None
+        st.session_state.pending_followup = followup_text.strip()
+        st.session_state.stage = "followup_opening"
+        st.rerun()
+
+elif st.session_state.stage == "followup_opening":
+    orch = cast(DebateOrchestrator, st.session_state.orch)
+    followup_num = st.session_state.followup_round + 1
+
+    st.subheader(f"Follow-up Round {followup_num}: Updated Opening Statements")
+    try:
+        with st.spinner("Generating updated opening statements..."):
+            run_async(orch.run_followup(st.session_state.pending_followup))
+        st.session_state.followup_input_text = ""
+        st.session_state.followup_round = followup_num
+        st.session_state.hot_seat_round = 0
+        st.session_state.stage = "hot_seat"
+        st.rerun()
+    except AgentAPIError as e:
+        st.session_state.debate_error = f"**{e.provider} Error** during follow-up: {e.message}"
+        st.session_state.followup_input_text = st.session_state.pending_followup
+        st.session_state.stage = "complete"
+        st.rerun()
+    except Exception as e:
+        st.session_state.debate_error = f"Unexpected error during follow-up: {e}"
+        st.session_state.followup_input_text = st.session_state.pending_followup
+        st.session_state.stage = "complete"
+        st.rerun()
 
 
 def main():
