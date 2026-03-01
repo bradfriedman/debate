@@ -90,7 +90,7 @@ class BaseAgent(abc.ABC):
         return text
 
     @abc.abstractmethod
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
         """Handles the LLM call, including tool execution loop."""
         pass
 
@@ -152,7 +152,7 @@ class OpenAIAgent(BaseAgent):
             }
         }]
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
         try:
             messages: list[ChatCompletionMessageParam] = [
                 {"role": "system", "content": self.system_prompt},
@@ -167,7 +167,11 @@ class OpenAIAgent(BaseAgent):
                 tool_choice="auto"
             )
 
-            msg = response.choices[0].message
+            choice = response.choices[0]
+            if choice.finish_reason == "content_filter":
+                raise AgentAPIError("OpenAI", "Response was blocked by OpenAI's content filters.")
+
+            msg = choice.message
 
             # Check for Tool Call
             if msg.tool_calls:
@@ -192,7 +196,10 @@ class OpenAIAgent(BaseAgent):
                     model=self.model_id,
                     messages=messages
                 )
-                return final_res.choices[0].message.content or ""
+                final_choice = final_res.choices[0]
+                if final_choice.finish_reason == "content_filter":
+                    raise AgentAPIError("OpenAI", "Response was blocked by OpenAI's content filters.")
+                return final_choice.message.content or ""
 
             return msg.content or ""
         except AgentAPIError:
@@ -220,21 +227,23 @@ class AnthropicAgent(BaseAgent):
             }
         }]
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
         try:
             messages: list[MessageParam] = [{"role": "user", "content": prompt}]
 
             response = self.client.messages.create(
                 model=self.model_id,
-                max_tokens=1024,
+                max_tokens=max_tokens,
                 system=self.system_prompt,
                 messages=messages,
                 tools=self.tools
             )
 
-            # Check Stop Reason
-            if response.stop_reason == "tool_use":
-                # Append Assistant's tool use intent
+            # Tool use loop — Claude may request multiple rounds of searches
+            max_tool_iterations = 5
+            iteration = 0
+            while response.stop_reason == "tool_use" and iteration < max_tool_iterations:
+                iteration += 1
                 messages.append({"role": "assistant", "content": response.content})
 
                 for block in response.content:
@@ -242,8 +251,6 @@ class AnthropicAgent(BaseAgent):
                         block_input = block.input
                         query = str(block_input.get("query", "")) if isinstance(block_input, dict) else ""
                         result = web_search(query)
-
-                        # Append Tool Result
                         messages.append({
                             "role": "user",
                             "content": [{
@@ -253,19 +260,23 @@ class AnthropicAgent(BaseAgent):
                             }]
                         })
 
-                # Final Call
-                final_res = self.client.messages.create(
+                response = self.client.messages.create(
                     model=self.model_id,
-                    max_tokens=1024,
+                    max_tokens=max_tokens,
                     system=self.system_prompt,
                     messages=messages,
                     tools=self.tools
                 )
-                text_blocks = [block for block in final_res.content if isinstance(block, TextBlock)]
-                return text_blocks[0].text if text_blocks else ""
 
             text_blocks = [block for block in response.content if isinstance(block, TextBlock)]
-            return text_blocks[0].text if text_blocks else ""
+            if not text_blocks:
+                block_types = [getattr(b, "type", type(b).__name__) for b in response.content]
+                raise AgentAPIError(
+                    "Anthropic",
+                    f"Empty text response "
+                    f"(stop_reason={response.stop_reason!r}, content_types={block_types})."
+                )
+            return text_blocks[0].text
         except AgentAPIError:
             raise
         except Exception as e:
@@ -294,7 +305,7 @@ class GeminiAgent(BaseAgent):
         )
         self.tools = types.Tool(function_declarations=[self.web_search_declaration])
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, max_tokens: int = 1024) -> str:
         try:
             contents: list[types.Content] = [
                 types.Content(
@@ -312,6 +323,15 @@ class GeminiAgent(BaseAgent):
                     tools=[self.tools]
                 )
             )
+
+            # Check for blocked response
+            if response.candidates:
+                fr = response.candidates[0].finish_reason
+                if fr is not None:
+                    fr_name = fr.name if hasattr(fr, "name") else str(fr)
+                    _GEMINI_BLOCKED = {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
+                    if fr_name in _GEMINI_BLOCKED:
+                        raise AgentAPIError("Gemini", f"Response blocked by content policy ({fr_name}).")
 
             # Check for function call
             if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
@@ -347,6 +367,14 @@ class GeminiAgent(BaseAgent):
                                     tools=[self.tools]
                                 )
                             )
+                            # Check final response for blocking
+                            if final_response.candidates:
+                                fr = final_response.candidates[0].finish_reason
+                                if fr is not None:
+                                    fr_name = fr.name if hasattr(fr, "name") else str(fr)
+                                    if fr_name in {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}:
+                                        raise AgentAPIError("Gemini", f"Response blocked by content policy ({fr_name}).")
+
                             # Extract text parts from final response
                             if final_response.candidates and final_response.candidates[0].content:
                                 text_parts = [p.text for p in (final_response.candidates[0].content.parts or []) if hasattr(p, 'text') and p.text]

@@ -2,8 +2,9 @@ import asyncio
 import random
 from typing import List
 from src.shared.models import ParticipantID, DialogueItem, TurnType, ModelOption
-from src.backend.agents import create_agent
-# For synthesis, we can just use the OpenAIAgent or whichever is P1 to save logic
+from src.backend.agents import create_agent, AgentAPIError
+
+MINIMUM_RESPONSE_CHARS = 15
 
 
 class DebateOrchestrator:
@@ -42,6 +43,18 @@ class DebateOrchestrator:
         }
         return self.api_keys.get(key_map.get(provider, ""))
 
+    def _validate_response(self, text: str, speaker: ParticipantID, context: str) -> None:
+        """Raise AgentAPIError if a response is blank or nearly blank."""
+        if len(text.strip()) < MINIMUM_RESPONSE_CHARS:
+            model_opt = self.assignments.get(speaker)
+            provider = model_opt.provider.capitalize() if model_opt else "Unknown"
+            model_name = model_opt.label if model_opt else speaker.value
+            raise AgentAPIError(
+                provider,
+                f"{model_name} ({speaker.value}) returned a blank or near-blank response "
+                f"during {context}. This may indicate an API issue or content filtering."
+            )
+
     # ... (Run Opening/HotSeat/Closing methods remain identical to previous design) ...
     # They call agent.generate_opening() etc., which are defined in BaseAgent
 
@@ -58,6 +71,8 @@ class DebateOrchestrator:
         results = await asyncio.gather(*tasks)
 
         for pid, text in zip(self.agents.keys(), results):
+            self._validate_response(text, pid, "opening statement")
+        for pid, text in zip(self.agents.keys(), results):
             self.transcript.append(DialogueItem(
                 speaker=pid, turn_type=TurnType.OPENING, content=text))
 
@@ -72,11 +87,13 @@ class DebateOrchestrator:
 
             # Asker
             q_text = await loop.run_in_executor(None, asker_agent.generate_question, self.transcript, hot_seat_pid)
+            self._validate_response(q_text, asker_pid, f"question to {hot_seat_pid.value}")
             self.transcript.append(DialogueItem(
                 speaker=asker_pid, turn_type=TurnType.QUESTION, target=hot_seat_pid, content=q_text))
 
             # Answerer
             a_text = await loop.run_in_executor(None, hot_seat_agent.generate_answer, self.transcript, q_text, asker_pid)
+            self._validate_response(a_text, hot_seat_pid, f"answer to {asker_pid.value}")
             self.transcript.append(DialogueItem(
                 speaker=hot_seat_pid, turn_type=TurnType.ANSWER, target=asker_pid, content=a_text))
 
@@ -85,6 +102,9 @@ class DebateOrchestrator:
         tasks = [loop.run_in_executor(
             None, agent.generate_closing, self.transcript) for agent in self.agents.values()]
         results = await asyncio.gather(*tasks)
+
+        for pid, text in zip(self.agents.keys(), results):
+            self._validate_response(text, pid, "closing statement")
         for pid, text in zip(self.agents.keys(), results):
             self.transcript.append(DialogueItem(
                 speaker=pid, turn_type=TurnType.CLOSING, content=text))
@@ -107,4 +127,6 @@ class DebateOrchestrator:
         )
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, synth_agent.generate, prompt)
+        report_text = await loop.run_in_executor(None, lambda: synth_agent.generate(prompt, max_tokens=4096))
+        self._validate_response(report_text, ParticipantID.P1, "synthesis report")
+        return report_text
